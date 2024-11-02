@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Kittens Carousel Static Website on S3 with CloudFront and Route 53 using an existing ACM certificate
+
+Parameters:
+  HostedZoneName:
+    Description: "Route 53 için DNS adı (örneğin, clarusway.us)"
+    Type: String
+  FullDomainName:
+    Description: "Tam alan adı (örneğin, kittens.clarusway.us)"
+    Type: String
+
+Resources:
+  
+  # S3 Bucket for Static Website without public access policies
+  KittensBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${FullDomainName}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      WebsiteConfiguration:
+        IndexDocument: "index.html"
+
+  # CloudFront Origin Access Identity (OAI)
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: "Access Identity for Kittens CloudFront Distribution"
+
+  # S3 Bucket Policy to allow CloudFront access
+  KittensBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KittensBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId  # CloudFront Identity for bucket access
+            Action: "s3:GetObject"
+            Resource: !Sub "${KittensBucket.Arn}/*"
+
+  # # CloudFront Origin Access Control (OAC)
+  # CloudFrontOAC:
+  #   Type: AWS::CloudFront::OriginAccessControl
+  #   Properties:
+  #     OriginAccessControlConfig:
+  #       Name: "KittensOAC"
+  #       SigningBehavior: "always"
+  #       OriginAccessControlOriginType: "s3"
+  #       SigningProtocol: "sigv4"
+
+  # Lambda IAM Role for ACM Certificate fetching
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "ACMCertificateFetcherRoleNew"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaACMPermission"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "acm:ListCertificates"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+
+  # Lambda Function to Fetch ACM Certificate
+  FetchACMCertificateLambdaNew:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "FetchACMCertificateLambdaNew"
+      Handler: "index.handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              logger.info("Lambda fonksiyonu başlatıldı.")
+              
+              # ACM sertifikasını alma işlemi
+              acm_client = boto3.client('acm')
+              response = acm_client.list_certificates()
+              
+              logger.info("Sertifikalar alındı.")
+              
+              # İlgili sertifikayı seçme ve döndürme
+              certificates = response.get('CertificateSummaryList', [])
+              certificate_arn = None  # Sertifika ARN'sini burada tanımlayın
+              # Sertifika ARN'sini belirlemek için uygun mantığı ekleyin
+              
+              return {
+                  'statusCode': 200,
+                  'CertificateArn': certificate_arn
+              }
+
+
+  # Custom Resource to Trigger Lambda for ACM Certificate fetching
+  GetACMCertificate:
+    Type: Custom::GetACMCertificate
+    Properties:
+      ServiceToken: !GetAtt FetchACMCertificateLambdaNew.Arn
+
+  # CloudFront Distribution with OAI
+  KittensCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt KittensBucket.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOAI}"  # Linking OAI
+        Enabled: true
+        DefaultRootObject: "index.html"
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn  # Using the certificate ARN parameter
+          SslSupportMethod: sni-only
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: "redirect-to-https"
+          AllowedMethods: ["GET", "HEAD"]
+          CachedMethods: ["GET", "HEAD"]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: "none"
+        Aliases:
+          - !Ref FullDomainName
+
+  # Route 53 Record Set
+  KittensRecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: Z07331912VPN28D9BPT4T  # Kendi Hosted Zone ID’nizi kullanın
+      # HostedZoneName: !Sub "${HostedZoneName}."
+      Name: !Ref FullDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt KittensCloudFront.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  KittensWebsiteURL:
+    Description: "Kittens Carousel Uygulama Tam Alan Adı"
+    Value: !Ref FullDomainName
+  CloudFrontEndpoint:
+    Description: "CloudFront Dağıtım Endpoint"
+    Value: !GetAtt KittensCloudFront.DomainName
+  S3BucketName:
+    Description: "S3 Bucket Adı"
+    Value: !Ref KittensBucket

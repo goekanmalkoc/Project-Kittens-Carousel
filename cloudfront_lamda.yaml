@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Kittens Carousel Static Website on S3 with CloudFront and Route 53 using an existing ACM certificate
+
+Parameters:
+  HostedZoneName:
+    Description: "Route 53 için DNS adı (örneğin, clarusway.us)"
+    Type: String
+    Default: "gokanmalkoc.click"
+  FullDomainName:
+    Description: "Tam alan adı (örneğin, kittens.clarusway.us)"
+    Type: String
+    Default: "kittens.gokanmalkoc.click"
+  DomainName:
+    Description: "ACM sertifikasını almak için alan adı"
+    Type: String
+    Default: "*.gokanmalkoc.click"
+    
+Resources:
+  # S3 Bucket for Static Website without public access policies
+  KittensBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${FullDomainName}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      WebsiteConfiguration:
+        IndexDocument: "index.html"
+
+  # CloudFront Origin Access Identity (OAI)
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: "Kittens CloudFront Dağıtımı için Erişim Kimliği"
+
+  # S3 Bucket Policy to allow CloudFront access
+  KittensBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KittensBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId  # CloudFront kimliği için bucket erişimi
+            Action: "s3:GetObject"
+            Resource: !Sub "${KittensBucket.Arn}/*"
+
+  # ACM Sertifika ARN'sini almak için Lambda fonksiyonu
+  CertificateRetrieverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Lambda fonksiyonu başlatıldı.")
+              
+              acm_client = boto3.client('acm')
+              
+              # DomainName parametresini kontrol etme
+              try:
+                  domain_name = event['ResourceProperties']['DomainName']
+                  logger.info(f"Domain adı alındı: {domain_name}")
+              except KeyError:
+                  logger.error("DomainName eksik.")
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {'Reason': 'DomainName eksik.'}
+                  )
+                  return
+              
+              try:
+                  # Sertifika listesini alma
+                  response = acm_client.list_certificates(CertificateStatuses=['ISSUED'])
+                  certificates = response.get('CertificateSummaryList', [])
+                  logger.info(f"Toplam bulunan sertifika sayısı: {len(certificates)}")
+
+                  # Sertifika arama
+                  for cert in certificates:
+                      logger.info(f"Sertifika kontrol ediliyor: {cert['DomainName']}")
+                      if domain_name == cert['DomainName']:
+                          certificate_arn = cert['CertificateArn']
+                          logger.info(f"Uygun sertifika bulundu: {certificate_arn}")
+
+                          # Başarılı yanıt gönder
+                          cfnresponse.send(
+                              event,
+                              context,
+                              cfnresponse.SUCCESS,
+                              {'CertificateArn': certificate_arn}
+                          )
+                          return
+                  
+                  # Uygun sertifika bulunamazsa
+                  logger.error(f"{domain_name} için uygun sertifika bulunamadı.")
+                  raise Exception(f"{domain_name} için uygun sertifika bulunamadı.")
+
+              except Exception as e:
+                  logger.exception("Hata meydana geldi")
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {'Reason': str(e)}
+                  )
+
+
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 128
+
+
+  # Lambda yürütme rolü
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "ACMListPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "acm:ListCertificates"
+                Resource: "*"
+
+  # Lambda fonksiyonunu çağırmak ve Sertifika ARN'sini almak için özel kaynak
+  CertificateRetriever:
+    Type: Custom::CertificateArn
+    Properties:
+      ServiceToken: !GetAtt CertificateRetrieverFunction.Arn
+      DomainName: !Ref DomainName
+
+  # CloudFront Dağıtımı ile OAI
+  KittensCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt KittensBucket.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CloudFrontOAI}"  # OAI ile bağlantı
+        Enabled: true
+        DefaultRootObject: "index.html"
+        ViewerCertificate:
+          AcmCertificateArn: !GetAtt CertificateRetriever.CertificateArn  # Alınan Sertifika ARN'sini kullanma
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: "redirect-to-https"
+          AllowedMethods: ["GET", "HEAD"]
+          CachedMethods: ["GET", "HEAD"]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: "none"
+        Aliases:
+          - !Ref FullDomainName
+
+  # Route 53 Kayıt Seti
+  KittensRecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: Z07331912VPN28D9BPT4T  # Kendi Hosted Zone ID’nizi kullanın
+      Name: !Ref FullDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt KittensCloudFront.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  KittensWebsiteURL:
+    Description: "Kittens Carousel Uygulama Tam Alan Adı"
+    Value: !Ref FullDomainName
+  CloudFrontEndpoint:
+    Description: "CloudFront Dağıtım Endpoint"
+    Value: !GetAtt KittensCloudFront.DomainName
+  S3BucketName:
+    Description: "S3 Bucket Adı"
+    Value: !Ref KittensBucket
